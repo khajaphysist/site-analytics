@@ -1,11 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -71,7 +76,7 @@ func getPublishedTime(doc *goquery.Document) (string, error) {
 func getLikesComments(doc *goquery.Document) (string, string) {
 	nlikes, ncomments := "", ""
 	doc.Find(".postActions").Each(func(i int, s *goquery.Selection) {
-		ss := strings.Split(s.Text(), " likes")
+		ss := strings.Split(s.Text(), " claps")
 		if len(ss) > 0 {
 			nlikes = ss[0]
 		}
@@ -90,9 +95,104 @@ func getTags(doc *goquery.Document) []string {
 	return ret
 }
 
-func main() {
-	url := ""
+// Article is
+type Article struct {
+	URL           string   `json:"url"`
+	Title         string   `json:"title"`
+	Author        string   `json:"author"`
+	Text          string   `json:"text"`
+	Nlikes        string   `json:"nlikes"`
+	Ncomments     string   `json:"ncomments"`
+	Tags          []string `json:"tags"`
+	PublishedTime string   `json:"publishedTime"`
+}
+
+func getArticle(url string) (Article, error) {
 	res, err := http.Get(url)
+	if err != nil {
+		return Article{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return Article{}, errors.New("status code error: " + res.Status)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	if err != nil {
+		return Article{}, err
+	}
+
+	title, err := getTitle(doc)
+	if err != nil {
+		return Article{}, err
+	}
+
+	author, err := getAuthor(doc)
+	if err != nil {
+		return Article{}, err
+	}
+
+	text, err := getText(doc)
+	if err != nil {
+		return Article{}, err
+	}
+
+	publishedTime, err := getPublishedTime(doc)
+	if err != nil {
+		return Article{}, err
+	}
+
+	nlikes, ncomments := getLikesComments(doc)
+
+	tags := getTags(doc)
+	return Article{
+		URL:           url,
+		Title:         title,
+		Author:        author,
+		Text:          text,
+		PublishedTime: publishedTime,
+		Tags:          tags,
+		Nlikes:        nlikes,
+		Ncomments:     ncomments,
+	}, nil
+}
+
+func saveArticle(art []Article, fileName string) error {
+	b, err := json.Marshal(art)
+	if err != nil {
+		return err
+	}
+	e := ioutil.WriteFile(fileName+".json", b, 0644)
+	if e != nil {
+		return err
+	}
+	return nil
+}
+
+func getAndSaveArticle(url string, index int, wg *sync.WaitGroup) error {
+	defer wg.Done()
+	article, err := getArticle(url)
+	if err != nil {
+		return err
+	}
+	e := saveArticle([]Article{article}, strconv.Itoa(index))
+	if e != nil {
+		return err
+	}
+	return nil
+}
+
+func saveArticles(urls []Article) {
+	var wg sync.WaitGroup
+	for i, url := range urls {
+		wg.Add(1)
+		go getAndSaveArticle(url.URL, i, &wg)
+	}
+	wg.Wait()
+}
+
+func getUrls(dayURL string) []Article {
+	res, err := http.Get(dayURL)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -106,34 +206,102 @@ func main() {
 		log.Fatal(err)
 	}
 
-	title, err := getTitle(doc)
+	ret := []Article{}
+	doc.Find(".streamItem .postArticle").Each(func(i int, s *goquery.Selection) {
+		art := Article{}
+
+		s.Find("h3").Each(func(j int, ss *goquery.Selection) {
+			art.Title = ss.Text()
+		})
+
+		if art.Title == "" {
+			return
+		}
+
+		s.Find(".postArticle-readMore a").Each(func(j int, ss *goquery.Selection) {
+			if val, exists := ss.Attr("href"); exists {
+				art.URL = strings.Split(val, "?")[0]
+			}
+		})
+
+		s.Find("a.avatar").Each(func(j int, ss *goquery.Selection) {
+			if val, exists := ss.Attr("href"); exists {
+				if strs := strings.Split(val, "@"); len(strs) > 1 {
+					art.Author = strs[1]
+				} else {
+					art.Author = strs[0]
+				}
+
+			}
+		})
+
+		s.Find("time").Each(func(j int, ss *goquery.Selection) {
+			if val, exists := ss.Attr("datetime"); exists {
+				art.PublishedTime = val
+			}
+		})
+
+		s.Find("div.js-actionMultirecommend").Each(func(j int, ss *goquery.Selection) {
+			if ss.Text() != "" {
+				art.Nlikes = ss.Text()
+			}
+		})
+
+		s.Find("div.u-floatRight").Each(func(j int, ss *goquery.Selection) {
+			if ss.Text() != "" {
+				art.Ncomments = strings.Split(ss.Text(), " ")[0]
+			}
+		})
+
+		ret = append(ret, art)
+	})
+	return ret
+}
+
+func printUrls(urls []Article) {
+	for _, url := range urls {
+		fmt.Println(url.PublishedTime)
+	}
+}
+
+func gatherUrlsForDay(t time.Time, tag string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	y, m, d := t.Date()
+	monthStr := ""
+	dayStr := ""
+	if month := int(m); month < 10 {
+		monthStr = "0" + strconv.Itoa(month)
+	} else {
+		monthStr = strconv.Itoa(month)
+	}
+	if d < 10 {
+		dayStr = "0" + strconv.Itoa(d)
+	} else {
+		dayStr = strconv.Itoa(d)
+	}
+	dateStr := strconv.Itoa(y) + "/" + monthStr + "/" + dayStr
+	url := "https://medium.com/tag/" + tag + "/archive/" + dateStr
+	fmt.Println(url)
+	urls := getUrls(url)
+	err := saveArticle(urls, tag+"-"+strings.Replace(dateStr, "/", "-", -1))
 	if err != nil {
 		log.Fatal(err)
 	}
+}
 
-	author, err := getAuthor(doc)
-	if err != nil {
-		log.Fatal(err)
+func gatherUrls(startDate, endDate time.Time, tag string) {
+	var wg sync.WaitGroup
+	for startDate.After(endDate) {
+		wg.Add(1)
+		go gatherUrlsForDay(startDate, tag, &wg)
+		startDate = startDate.AddDate(0, 0, -1)
 	}
+	wg.Wait()
+}
 
-	text, err := getText(doc)
-	if err != nil {
-		log.Fatal(err)
-	}
+func main() {
+	startDate, _ := time.Parse(time.RFC3339, "2019-01-23T05:41:02.000Z")
+	endDate, _ := time.Parse(time.RFC3339, "2018-12-23T05:40:02.000Z")
 
-	publishedTime, err := getPublishedTime(doc)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	nlikes, ncomments := getLikesComments(doc)
-
-	tags := getTags(doc)
-
-	fmt.Println(title)
-	fmt.Println(author)
-	fmt.Println(text)
-	fmt.Println(nlikes, " ", ncomments)
-	fmt.Println(tags)
-	fmt.Println(publishedTime)
+	gatherUrls(startDate, endDate, "javascript")
 }
