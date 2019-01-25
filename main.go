@@ -107,6 +107,18 @@ type Article struct {
 	PublishedTime string   `json:"publishedTime"`
 }
 
+// ArticleMap is safe datastructure
+type ArticleMap struct {
+	Data map[string]Article
+	mux  sync.Mutex
+}
+
+func (m *ArticleMap) set(key string, value Article) {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	m.Data[key] = value
+}
+
 func getArticle(url string) (Article, error) {
 	res, err := http.Get(url)
 	if err != nil {
@@ -264,7 +276,7 @@ func printUrls(urls []Article) {
 	}
 }
 
-func gatherUrlsForDay(t time.Time, tag string, wg *sync.WaitGroup) {
+func gatherUrlsForDay(t time.Time, tag string, wg *sync.WaitGroup, am *ArticleMap, gaurd *chan bool) {
 	defer wg.Done()
 	y, m, d := t.Date()
 	monthStr := ""
@@ -283,25 +295,39 @@ func gatherUrlsForDay(t time.Time, tag string, wg *sync.WaitGroup) {
 	url := "https://medium.com/tag/" + tag + "/archive/" + dateStr
 	fmt.Println(url)
 	urls := getUrls(url)
-	err := saveArticle(urls, tag+"-"+strings.Replace(dateStr, "/", "-", -1))
-	if err != nil {
-		log.Fatal(err)
+	for _, val := range urls {
+		am.set(val.URL, val)
 	}
+	<-*gaurd
 }
 
-func gatherUrls(startDate, endDate time.Time, tag string) {
+func gatherUrls(startDate, endDate time.Time, tag string) []Article {
 	var wg sync.WaitGroup
+	maxConcurrent := 40
+	garud := make(chan bool, maxConcurrent)
+
+	var am ArticleMap
+	am.Data = make(map[string]Article)
 	for startDate.After(endDate) {
 		wg.Add(1)
-		go gatherUrlsForDay(startDate, tag, &wg)
+		garud <- true
+		go gatherUrlsForDay(startDate, tag, &wg, &am, &garud)
 		startDate = startDate.AddDate(0, 0, -1)
 	}
 	wg.Wait()
+	ret := make([]Article, len(am.Data))
+	idx := 0
+	for _, val := range am.Data {
+		ret[idx] = val
+		idx++
+	}
+	return ret
 }
 
 func main() {
 	startDate, _ := time.Parse(time.RFC3339, "2019-01-23T05:41:02.000Z")
-	endDate, _ := time.Parse(time.RFC3339, "2018-12-23T05:40:02.000Z")
+	endDate, _ := time.Parse(time.RFC3339, "2018-01-23T05:40:02.000Z")
 
-	gatherUrls(startDate, endDate, "javascript")
+	urls := gatherUrls(startDate, endDate, "javascript")
+	saveArticle(urls, "urls")
 }
