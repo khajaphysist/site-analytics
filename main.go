@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,15 +74,23 @@ func getPublishedTime(doc *goquery.Document) (string, error) {
 	return ret, nil
 }
 
-func getLikesComments(doc *goquery.Document) (string, string) {
-	nlikes, ncomments := "", ""
+func getLikesComments(doc *goquery.Document) (int, int) {
+	nlikes, ncomments := 0, 0
 	doc.Find(".postActions").Each(func(i int, s *goquery.Selection) {
 		ss := strings.Split(s.Text(), " claps")
 		if len(ss) > 0 {
-			nlikes = ss[0]
+			val, err := getNumberFromString(ss[0])
+			if err != nil {
+				log.Println(err, ss)
+			}
+			nlikes = val
 		}
 		if len(ss) > 1 {
-			ncomments = ss[1]
+			val, err := getNumberFromString(ss[1])
+			if err != nil {
+				log.Println(err, ss)
+			}
+			ncomments = val
 		}
 	})
 	return nlikes, ncomments
@@ -101,8 +110,8 @@ type Article struct {
 	Title         string   `json:"title"`
 	Author        string   `json:"author"`
 	Text          string   `json:"text"`
-	Nlikes        string   `json:"nlikes"`
-	Ncomments     string   `json:"ncomments"`
+	Nlikes        int      `json:"nlikes"`
+	Ncomments     int      `json:"ncomments"`
 	Tags          []string `json:"tags"`
 	PublishedTime string   `json:"publishedTime"`
 }
@@ -119,6 +128,30 @@ func (m *ArticleMap) set(key string, value Article) {
 	m.Data[key] = value
 }
 
+func getNumberFromString(s string) (int, error) {
+	s = strings.ToLower(s)
+	if strings.Contains(s, "k") {
+		s = strings.TrimSuffix(s, "k")
+		if strings.Contains(s, ".") {
+			ret, err := strconv.ParseFloat(s, 32)
+			if err != nil {
+				return 0, err
+			}
+			return int(ret) * 1000, nil
+		}
+		ret, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, err
+		}
+		return ret * 1000, nil
+	}
+	ret, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	return ret, nil
+}
+
 func getArticle(url string) (Article, error) {
 	res, err := http.Get(url)
 	if err != nil {
@@ -130,6 +163,7 @@ func getArticle(url string) (Article, error) {
 	}
 
 	doc, err := goquery.NewDocumentFromReader(res.Body)
+	defer res.Body.Close()
 	if err != nil {
 		return Article{}, err
 	}
@@ -222,6 +256,10 @@ func getUrls(dayURL string) []Article {
 	doc.Find(".streamItem .postArticle").Each(func(i int, s *goquery.Selection) {
 		art := Article{}
 
+		if s.Children().Is("a") {
+			return
+		}
+
 		s.Find("h3").Each(func(j int, ss *goquery.Selection) {
 			art.Title = ss.Text()
 		})
@@ -255,13 +293,21 @@ func getUrls(dayURL string) []Article {
 
 		s.Find("div.js-actionMultirecommend").Each(func(j int, ss *goquery.Selection) {
 			if ss.Text() != "" {
-				art.Nlikes = ss.Text()
+				val, err := getNumberFromString(ss.Text())
+				if err != nil {
+					log.Println(err, dayURL)
+				}
+				art.Nlikes = val
 			}
 		})
 
 		s.Find("div.u-floatRight").Each(func(j int, ss *goquery.Selection) {
 			if ss.Text() != "" {
-				art.Ncomments = strings.Split(ss.Text(), " ")[0]
+				val, err := getNumberFromString(strings.Split(ss.Text(), " ")[0])
+				if err != nil {
+					log.Println(err, dayURL)
+				}
+				art.Ncomments = val
 			}
 		})
 
@@ -293,10 +339,13 @@ func gatherUrlsForDay(t time.Time, tag string, wg *sync.WaitGroup, am *ArticleMa
 	}
 	dateStr := strconv.Itoa(y) + "/" + monthStr + "/" + dayStr
 	url := "https://medium.com/tag/" + tag + "/archive/" + dateStr
-	fmt.Println(url)
 	urls := getUrls(url)
 	for _, val := range urls {
 		am.set(val.URL, val)
+	}
+	err := saveToEls(urls)
+	if err == nil {
+		fmt.Println(url)
 	}
 	<-*gaurd
 }
@@ -312,6 +361,7 @@ func gatherUrls(startDate, endDate time.Time, tag string) []Article {
 		wg.Add(1)
 		garud <- true
 		go gatherUrlsForDay(startDate, tag, &wg, &am, &garud)
+		time.Sleep(100000)
 		startDate = startDate.AddDate(0, 0, -1)
 	}
 	wg.Wait()
@@ -324,9 +374,33 @@ func gatherUrls(startDate, endDate time.Time, tag string) []Article {
 	return ret
 }
 
+func saveToEls(articles []Article) error {
+	elsURL := "http://178.128.126.80:9200/articles/_doc/"
+	var wg sync.WaitGroup
+	maxConcurrent := 20
+	garud := make(chan bool, maxConcurrent)
+	for _, v := range articles {
+		wg.Add(1)
+		garud <- true
+		go func(art Article) {
+			jsVal, _ := json.Marshal(art)
+			resp, err := http.Post(elsURL+art.Author+"-"+art.PublishedTime, "application/json", bytes.NewBuffer(jsVal))
+			if err != nil {
+				log.Fatal(err, resp)
+			}
+			defer resp.Body.Close()
+			wg.Done()
+			<-garud
+		}(v)
+		time.Sleep(10000)
+	}
+	wg.Wait()
+	return nil
+}
+
 func main() {
-	startDate, _ := time.Parse(time.RFC3339, "2019-01-23T05:41:02.000Z")
-	endDate, _ := time.Parse(time.RFC3339, "2018-01-23T05:40:02.000Z")
+	startDate, _ := time.Parse(time.RFC3339, "2009-11-31T05:41:02.000Z")
+	endDate, _ := time.Parse(time.RFC3339, "2009-01-23T05:40:02.000Z")
 
 	urls := gatherUrls(startDate, endDate, "javascript")
 	saveArticle(urls, "urls")
