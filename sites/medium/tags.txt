@@ -152,3 +152,7 @@ serverless
 lambda
 amazon-web-services
 cloud
+android-app-development
+artificial-intelligence
+android-development
+startup
