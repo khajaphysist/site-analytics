@@ -370,7 +370,6 @@ func addUser(user *User) {
 			  affected_rows
 			}
 		  }`,
-		"variables": nil,
 	}
 	uJsonValue, _ := json.Marshal(values)
 	uResp, err := httpClient.Post("http://localhost:8080/v1alpha1/graphql", "application/json", bytes.NewBuffer(uJsonValue))
@@ -438,17 +437,17 @@ func addPost(post *Post, allAuthors *map[string]User) {
 		}
 		post.dbID = string(insertRes)
 	}
-	if len(post.tags) > 0 {
-		fmt.Println(post.tags)
-	}
 
 	for _, tag := range post.tags {
 		addTagReq, _ := json.Marshal(map[string]string{
 			"query": `mutation {
-				insert_jotts_post_tag(objects: {tagByTag: {data: {tag: "` + tag.Slug + `"}}, post_id: "` + post.dbID + `"}) {
+				insert_jotts_tag(objects: {tag: "` + tag.Slug + `"}, on_conflict: {constraint: tag_pkey, update_columns: tag}) {
 				  affected_rows
 				}
-			  }
+				insert_jotts_post_tag(objects: {tag: "` + tag.Slug + `", post_id: "` + post.dbID + `"}, on_conflict: {constraint: post_tag_pkey, update_columns: post_id}) {
+				  affected_rows
+				}
+			  }			  
 			  `,
 		})
 		resp, err := httpClient.Post("http://localhost:8080/v1alpha1/graphql", "application/json", bytes.NewBuffer(addTagReq))
@@ -457,7 +456,6 @@ func addPost(post *Post, allAuthors *map[string]User) {
 		}
 		defer resp.Body.Close()
 		body, _ := ioutil.ReadAll(resp.Body)
-		fmt.Println(string(body))
 		if resp.StatusCode != 200 {
 			fmt.Println(string(body))
 		}
@@ -466,7 +464,22 @@ func addPost(post *Post, allAuthors *map[string]User) {
 
 func main() {
 	allUsers, allPosts := gatherFinalData()
+	count := 0
+	wg := &sync.WaitGroup{}
+	c := make(chan bool, 20)
 	for _, post := range allPosts {
-		addPost(&post, &allUsers)
+		if post.Type != "Post" && post.Language != "en" {
+			continue
+		}
+		count++
+		c <- true
+		wg.Add(1)
+		go func(post Post) {
+			addPost(&post, &allUsers)
+			<-c
+			wg.Done()
+		}(post)
 	}
+	wg.Wait()
+	fmt.Println(count)
 }
